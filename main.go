@@ -1,49 +1,50 @@
 package main
 
 import (
+	"archive/zip"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io" // Importado agora para uso na cópia de arquivos
 	"log"
 	"net/http"
 	"os"
+	"os/exec" // Para executar comandos externos como FFmpeg
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	_ "github.com/lib/pq"
 	amqp "github.com/rabbitmq/amqp091-go"
-	jwt "github.com/golang-jwt/jwt/v5" // Para JWT, consistente com o user-auth-service
+	jwt "github.com/golang-jwt/jwt/v5"
 )
 
 var db *sql.DB
 var rabbitMQConn *amqp.Connection
-var jwtSecret = []byte(os.Getenv("JWT_SECRET")) // Chave secreta para JWT. OBRIGATÓRIO definir via variável de ambiente!
+var jwtSecret = []byte(os.Getenv("JWT_SECRET"))
 
 func init() {
-    // Defina uma chave secreta padrão para desenvolvimento se a variável de ambiente não estiver definida
     if len(jwtSecret) == 0 {
         log.Println("WARNING: JWT_SECRET environment variable not set. Using a default secret for development. THIS IS INSECURE FOR PRODUCTION!")
         jwtSecret = []byte("supersecretjwtkeythatshouldbeverylongandrandominproduction")
     }
 }
 
-// Estrutura para o payload do JWT (igual ao user-auth-service)
 type Claims struct {
 	Username string `json:"username"`
 	UserID   int    `json:"user_id"`
 	jwt.RegisteredClaims
 }
 
-// Estrutura para a mensagem que será enviada para a fila
 type VideoProcessingMessage struct {
 	UserID            int    `json:"user_id"`
 	VideoPath         string `json:"video_path"`
 	OriginalFilename  string `json:"original_filename"`
 	ProcessingStarted time.Time `json:"processing_started"`
+	VideoStatusID     int    `json:"video_status_id"` // Adiciona o ID do status do DB
 }
 
-// Função auxiliar para tratamento de erros do RabbitMQ
 func failOnError(err error, msg string) {
 	if err != nil {
 		log.Fatalf("%s: %s", msg, err)
@@ -124,7 +125,6 @@ func initRabbitMQ() {
 	log.Fatalf("Falha crítica: Não foi possível conectar ao RabbitMQ após várias tentativas: %v", err)
 }
 
-// Middleware de autenticação JWT (similar ao do Auth Service)
 func authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tokenString := c.GetHeader("Authorization")
@@ -156,18 +156,17 @@ func authMiddleware() gin.HandlerFunc {
 	}
 }
 
-// Handler para upload de vídeo
 func uploadVideo(c *gin.Context) {
-	userID := c.MustGet("user_id").(int) // Obtém o ID do usuário do JWT
+	userID := c.MustGet("user_id").(int)
 
-	file, err := c.FormFile("video") // "video" é o nome esperado do campo no formulário multipart
+	file, err := c.FormFile("video")
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Failed to get video file: %v", err)})
 		return
 	}
 
 	// Criar diretório para uploads se não existir
-	uploadDir := "./uploads" // Caminho relativo ao WORKDIR do container
+	uploadDir := "./uploads"
 	if _, err := os.Stat(uploadDir); os.IsNotExist(err) {
 		os.Mkdir(uploadDir, 0755)
 	}
@@ -182,12 +181,23 @@ func uploadVideo(c *gin.Context) {
 		return
 	}
 
-	// Criar a mensagem para a fila
+	// Registrar o status inicial "PENDING" no banco de dados e obter o ID
+	query := `INSERT INTO video_processing_statuses (user_id, video_original_filename, status) VALUES ($1, $2, $3) RETURNING id`
+	var videoStatusID int
+	err = db.QueryRow(query, userID, file.Filename, "PENDING").Scan(&videoStatusID)
+	if err != nil {
+		log.Printf("Error inserting initial video status: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to record video status"})
+		return
+	}
+
+	// Criar a mensagem para a fila, incluindo o VideoStatusID
 	message := VideoProcessingMessage{
 		UserID:            userID,
 		VideoPath:         filePath,
 		OriginalFilename:  file.Filename,
 		ProcessingStarted: time.Now(),
+		VideoStatusID:     videoStatusID, // Inclui o ID do status do DB
 	}
 
 	body, err := json.Marshal(message)
@@ -196,14 +206,13 @@ func uploadVideo(c *gin.Context) {
 		return
 	}
 
-	// Publicar a mensagem na fila RabbitMQ
 	ch, err := rabbitMQConn.Channel()
 	failOnError(err, "Failed to open a channel")
 	defer ch.Close()
 
 	q, err := ch.QueueDeclare(
-		"video_processing_queue", // nome da fila
-		true,   // durable (persiste no broker)
+		"video_processing_queue",
+		true,   // durable
 		false,  // delete when unused
 		false,  // exclusive
 		false,  // no-wait
@@ -212,37 +221,47 @@ func uploadVideo(c *gin.Context) {
 	failOnError(err, "Failed to declare a queue")
 
 	err = ch.Publish(
-		"",     // exchange
-		q.Name, // routing key (nome da fila)
-		false,  // mandatory
-		false,  // immediate
+		"",
+		q.Name,
+		false,
+		false,
 		amqp.Publishing{
 			ContentType: "application/json",
 			Body:        body,
 		})
 	failOnError(err, "Failed to publish a message")
-	log.Printf(" [x] Sent %s", body)
+	log.Printf(" [x] Sent message for video: %s (Status ID: %d)", file.Filename, videoStatusID)
 
-	// Registrar o status inicial no banco de dados
-	// (usaremos a função updateVideoStatus futuramente, por enquanto só insere PENDING)
-	_, err = db.Exec(`INSERT INTO video_processing_statuses (user_id, video_original_filename, status) VALUES ($1, $2, $3)`,
-		userID, file.Filename, "PENDING")
-	if err != nil {
-		log.Printf("Error inserting initial video status: %v", err)
-		// Não retornamos erro HTTP crítico aqui, pois o upload e o envio para fila funcionaram
-	}
-
-	c.JSON(http.StatusOK, gin.H{"message": "Video uploaded and queued for processing", "filename": file.Filename})
+	c.JSON(http.StatusOK, gin.H{"message": "Video uploaded and queued for processing", "filename": file.Filename, "video_status_id": videoStatusID})
 }
 
-// Função que consome mensagens da fila (simples para demonstração, processamento real virá depois)
+// Função para atualizar o status do vídeo no banco de dados
+func updateVideoStatus(videoStatusID int, status string, processedFilePath, errorMessage string) {
+	query := `UPDATE video_processing_statuses SET status = $1, processed_file_path = $2, error_message = $3, updated_at = NOW() WHERE id = $4`
+	_, err := db.Exec(query, status, processedFilePath, errorMessage, videoStatusID)
+	if err != nil {
+		log.Printf("ERROR: Failed to update video status for ID %d: %v", videoStatusID, err)
+	} else {
+		log.Printf("Video status ID %d updated to: %s", videoStatusID, status)
+	}
+}
+
+// Função para simular o envio de notificação
+func sendNotification(userID int, originalFilename, status, message string) {
+	log.Printf("NOTIFICAÇÃO para User ID %d - Vídeo '%s' Status: %s. Mensagem: %s", userID, originalFilename, status, message)
+	// Em um ambiente real, você integraria com um serviço de e-mail (SendGrid, Mailgun)
+	// ou um serviço de notificação push aqui.
+}
+
+
+// Função que consome mensagens da fila e processa o vídeo
 func startConsumer() {
 	ch, err := rabbitMQConn.Channel()
 	failOnError(err, "Failed to open a channel for consumer")
 	defer ch.Close()
 
 	q, err := ch.QueueDeclare(
-		"video_processing_queue", // mesmo nome da fila usada para publicar
+		"video_processing_queue",
 		true,   // durable
 		false,  // delete when unused
 		false,  // exclusive
@@ -268,20 +287,100 @@ func startConsumer() {
 	go func() {
 		for d := range msgs {
 			log.Printf(" [x] Received a message: %s", d.Body)
-			// Aqui você implementaria a lógica de processamento real:
-			// 1. Deserializar a mensagem para VideoProcessingMessage
-			// 2. Chamar FFmpeg para extrair frames
-			// 3. Compactar em ZIP
-			// 4. Salvar o ZIP
-			// 5. Atualizar o status no DB (COMPLETED/FAILED)
-			// 6. Enviar notificação ao usuário
+
+			var msg VideoProcessingMessage
+			err := json.Unmarshal(d.Body, &msg)
+			if err != nil {
+				log.Printf("ERROR: Failed to unmarshal message: %v", err)
+				continue // Pula para a próxima mensagem se a deserialização falhar
+			}
+
+			updateVideoStatus(msg.VideoStatusID, "PROCESSING", "", "") // Atualiza status para PROCESSING
+			sendNotification(msg.UserID, msg.OriginalFilename, "PROCESSING", "Seu vídeo está sendo processado.")
+
+			// --- Lógica de Processamento REAL do Vídeo com FFmpeg ---
+			outputDir := fmt.Sprintf("./processed_videos/%d", msg.UserID) // Pasta por usuário
+			if _, err := os.Stat(outputDir); os.IsNotExist(err) {
+				os.MkdirAll(outputDir, 0755) // Cria diretórios recursivamente
+			}
+
+			// Extrair frames (a cada 1 segundo, como exemplo)
+			framePattern := filepath.Join(outputDir, fmt.Sprintf("%s_%%04d.png", filepath.Base(msg.OriginalFilename)))
+			cmd := exec.Command("ffmpeg", "-i", msg.VideoPath, "-vf", "fps=1", framePattern) // Extrai 1 frame por segundo
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr // Redireciona a saída do FFmpeg para os logs do Docker
+
+			err = cmd.Run()
+			if err != nil {
+				errorMessage := fmt.Sprintf("FFmpeg failed to extract frames: %v", err)
+				log.Printf("ERROR processing video '%s': %s", msg.OriginalFilename, errorMessage)
+				updateVideoStatus(msg.VideoStatusID, "FAILED", "", errorMessage)
+				sendNotification(msg.UserID, msg.OriginalFilename, "FAILED", fmt.Sprintf("Falha ao processar vídeo: %s", errorMessage))
+				continue
+			}
+
+			// Criar o arquivo ZIP com os frames
+			zipFilename := fmt.Sprintf("%d_%s_processed.zip", msg.UserID, filepath.Base(msg.OriginalFilename))
+			zipFilePath := filepath.Join(outputDir, zipFilename)
+			newZipFile, err := os.Create(zipFilePath)
+			if err != nil {
+				errorMessage := fmt.Sprintf("Failed to create zip file: %v", err)
+				log.Printf("ERROR zipping frames for '%s': %s", msg.OriginalFilename, errorMessage)
+				updateVideoStatus(msg.VideoStatusID, "FAILED", "", errorMessage)
+				sendNotification(msg.UserID, msg.OriginalFilename, "FAILED", fmt.Sprintf("Falha ao compactar frames: %s", errorMessage))
+				continue
+			}
+			defer newZipFile.Close()
+
+			zipWriter := zip.NewWriter(newZipFile)
+			defer zipWriter.Close()
+
+			// Adicionar cada frame ao ZIP
+			frames, _ := filepath.Glob(filepath.Join(outputDir, fmt.Sprintf("%s_*.png", filepath.Base(msg.OriginalFilename))))
+			if len(frames) == 0 {
+				errorMessage := "No frames extracted to zip."
+				log.Printf("WARNING: %s", errorMessage)
+				updateVideoStatus(msg.VideoStatusID, "FAILED", "", errorMessage)
+				sendNotification(msg.UserID, msg.OriginalFilename, "FAILED", "Nenhum frame extraído para compactar.")
+				continue
+			}
+
+			for _, framePath := range frames {
+				frameFile, err := os.Open(framePath)
+				if err != nil {
+					log.Printf("WARNING: Could not open frame %s: %v", framePath, err)
+					continue
+				}
+				defer frameFile.Close()
+
+				writer, err := zipWriter.Create(filepath.Base(framePath))
+				if err != nil {
+					log.Printf("WARNING: Could not create entry for %s in zip: %v", framePath, err)
+					continue
+				}
+				_, err = io.Copy(writer, frameFile)
+				if err != nil {
+					log.Printf("WARNING: Could not copy %s to zip: %v", framePath, err)
+					continue
+				}
+			}
+
+			// Limpar frames temporários após o ZIP ser criado
+			for _, framePath := range frames {
+				os.Remove(framePath)
+			}
+			os.Remove(msg.VideoPath) // Remove o vídeo original após processamento
+
+			// --- Fim da Lógica de Processamento REAL ---
+
+			updateVideoStatus(msg.VideoStatusID, "COMPLETED", zipFilePath, "") // Atualiza status para COMPLETED
+			sendNotification(msg.UserID, msg.OriginalFilename, "COMPLETED", fmt.Sprintf("Seu vídeo '%s' foi processado com sucesso! Arquivo ZIP disponível em: %s", msg.OriginalFilename, zipFilePath))
 		}
 	}()
 
 	<-forever // Mantém o consumidor rodando
 }
 
-// Handler para health check
 func healthCheck(c *gin.Context) {
 	dbStatus := "connected"
 	if err := db.Ping(); err != nil {
@@ -322,31 +421,6 @@ func main() {
 	initRabbitMQ()
 	defer rabbitMQConn.Close()
 
-	// Inicia o consumidor de mensagens em uma goroutine separada
-	go startConsumer()
+	go startConsumer() // Inicia o consumidor de mensagens em uma goroutine separada
 
-	router := gin.Default()
-
-	// Rota de Health Check e raiz
-	router.GET("/health", healthCheck)
-	router.GET("/", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"message": "Video Processor Service is running!"})
-	})
-
-	// Rotas protegidas por JWT
-	// Este é o endpoint para upload de vídeos
-	authRoutes := router.Group("/") // Grupo base para rotas protegidas
-	authRoutes.Use(authMiddleware())
-	{
-		authRoutes.POST("/upload", uploadVideo)
-		// Futuramente: rotas para listar status de vídeo, download, etc.
-	}
-
-
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "5001" // Porta diferente do Auth Service
-	}
-	log.Printf("Video Processor Service escutando na porta :%s...", port)
-	log.Fatal(router.Run(":" + port))
-}
+	router := gin
