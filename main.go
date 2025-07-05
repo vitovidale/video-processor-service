@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec" // Para executar comandos externos como FFmpeg
 	"path/filepath"
-	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
