@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv" // Adicionado para converter string para int
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -44,13 +45,12 @@ type VideoProcessingMessage struct {
 	VideoStatusID     int    `json:"video_status_id"`
 }
 
-// NOVA STRUCT para a resposta da listagem de status
 type VideoStatusResponse struct {
     ID               int       `json:"id"`
     OriginalFilename string    `json:"original_filename"`
     Status           string    `json:"status"`
-    ProcessedFilePath string   `json:"processed_file_path,omitempty"` // omitempty para não incluir se for nulo
-    ErrorMessage     string    `json:"error_message,omitempty"`     // omitempty para não incluir se for nulo
+    ProcessedFilePath string   `json:"processed_file_path,omitempty"`
+    ErrorMessage     string    `json:"error_message,omitempty"`
     CreatedAt        time.Time `json:"created_at"`
     UpdatedAt        time.Time `json:"updated_at"`
 }
@@ -240,9 +240,8 @@ func uploadVideo(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Video uploaded and queued for processing", "filename": file.Filename, "video_status_id": videoStatusID})
 }
 
-// NOVA FUNÇÃO: Handler para listar status de vídeos de um usuário
 func listVideosStatus(c *gin.Context) {
-    userID := c.MustGet("user_id").(int) // Obtém o ID do usuário do JWT
+    userID := c.MustGet("user_id").(int)
 
     rows, err := db.Query(`SELECT id, video_original_filename, status, processed_file_path, error_message, created_at, updated_at FROM video_processing_statuses WHERE user_id = $1 ORDER BY created_at DESC`, userID)
     if err != nil {
@@ -254,7 +253,7 @@ func listVideosStatus(c *gin.Context) {
     var statuses []VideoStatusResponse
     for rows.Next() {
         var s VideoStatusResponse
-        var processedFilePath, errorMessage sql.NullString // Usar sql.NullString para campos que podem ser NULL
+        var processedFilePath, errorMessage sql.NullString
         err := rows.Scan(&s.ID, &s.OriginalFilename, &s.Status, &processedFilePath, &errorMessage, &s.CreatedAt, &s.UpdatedAt)
         if err != nil {
             log.Printf("Error scanning video status row: %v", err)
@@ -273,7 +272,57 @@ func listVideosStatus(c *gin.Context) {
     c.JSON(http.StatusOK, statuses)
 }
 
-// Função para atualizar o status do vídeo no banco de dados
+// NOVA FUNÇÃO: Handler para download do vídeo processado
+func downloadProcessedVideo(c *gin.Context) {
+    userID := c.MustGet("user_id").(int) // Obtém o ID do usuário do JWT
+    videoIDStr := c.Param("id")          // Obtém o ID do vídeo da URL
+
+    videoID, err := strconv.Atoi(videoIDStr)
+    if err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid video ID"})
+        return
+    }
+
+    var processedFilePath sql.NullString
+    var videoUserID int // Para verificar se o vídeo pertence ao usuário
+    query := `SELECT processed_file_path, user_id FROM video_processing_statuses WHERE id = $1 AND status = 'COMPLETED'`
+    err = db.QueryRow(query, videoID).Scan(&processedFilePath, &videoUserID)
+    if err != nil {
+        if err == sql.ErrNoRows {
+            c.JSON(http.StatusNotFound, gin.H{"error": "Processed video not found or not completed"})
+            return
+        }
+        c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to query video path: %v", err)})
+        return
+    }
+
+    // Verifique se o vídeo pertence ao usuário logado
+    if videoUserID != userID {
+        c.JSON(http.StatusForbidden, gin.H{"error": "Access denied: Video does not belong to this user"})
+        return
+    }
+
+    // Verifique se o caminho do arquivo processado existe
+    if !processedFilePath.Valid || processedFilePath.String == "" {
+        c.JSON(http.StatusNotFound, gin.H{"error": "Processed file path not found or invalid"})
+        return
+    }
+
+    // Servir o arquivo ZIP
+    // Use c.File() para servir o arquivo diretamente
+    // Note: O caminho é relativo ao WORKDIR do container (/app)
+    filePathToServe := filepath.Join("/app", processedFilePath.String)
+
+    // Verifique se o arquivo existe no sistema de arquivos do contêiner
+    if _, err := os.Stat(filePathToServe); os.IsNotExist(err) {
+        c.JSON(http.StatusNotFound, gin.H{"error": "Processed file not found on server storage"})
+        return
+    }
+
+    c.FileAttachment(filePathToServe, filepath.Base(processedFilePath.String))
+}
+
+
 func updateVideoStatus(videoStatusID int, status string, processedFilePath, errorMessage string) {
 	query := `UPDATE video_processing_statuses SET status = $1, processed_file_path = $2, error_message = $3, updated_at = NOW() WHERE id = $4`
 	_, err := db.Exec(query, status, processedFilePath, errorMessage, videoStatusID)
@@ -284,13 +333,11 @@ func updateVideoStatus(videoStatusID int, status string, processedFilePath, erro
 	}
 }
 
-// Função para simular o envio de notificação
 func sendNotification(userID int, originalFilename, status, message string) {
 	log.Printf("NOTIFICAÇÃO para User ID %d - Vídeo '%s' Status: %s. Mensagem: %s", userID, originalFilename, status, message)
 }
 
 
-// Função que consome mensagens da fila e processa o vídeo
 func startConsumer() {
 	ch, err := rabbitMQConn.Channel()
 	failOnError(err, "Failed to open a channel for consumer")
@@ -464,7 +511,8 @@ func main() {
 	authRoutes.Use(authMiddleware())
 	{
 		authRoutes.POST("/upload", uploadVideo)
-        authRoutes.GET("/videos/status", listVideosStatus) // <--- ROTA: Listar status de vídeos
+        authRoutes.GET("/videos/status", listVideosStatus)
+        authRoutes.GET("/videos/:id/download", downloadProcessedVideo) // <--- ROTA: Download de vídeo
 	}
 
 	port := os.Getenv("PORT")
