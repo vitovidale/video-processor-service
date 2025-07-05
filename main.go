@@ -11,7 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv" // Adicionado para converter string para int
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -272,10 +272,9 @@ func listVideosStatus(c *gin.Context) {
     c.JSON(http.StatusOK, statuses)
 }
 
-// NOVA FUNÇÃO: Handler para download do vídeo processado
 func downloadProcessedVideo(c *gin.Context) {
-    userID := c.MustGet("user_id").(int) // Obtém o ID do usuário do JWT
-    videoIDStr := c.Param("id")          // Obtém o ID do vídeo da URL
+    userID := c.MustGet("user_id").(int)
+    videoIDStr := c.Param("id")
 
     videoID, err := strconv.Atoi(videoIDStr)
     if err != nil {
@@ -284,7 +283,7 @@ func downloadProcessedVideo(c *gin.Context) {
     }
 
     var processedFilePath sql.NullString
-    var videoUserID int // Para verificar se o vídeo pertence ao usuário
+    var videoUserID int
     query := `SELECT processed_file_path, user_id FROM video_processing_statuses WHERE id = $1 AND status = 'COMPLETED'`
     err = db.QueryRow(query, videoID).Scan(&processedFilePath, &videoUserID)
     if err != nil {
@@ -296,24 +295,18 @@ func downloadProcessedVideo(c *gin.Context) {
         return
     }
 
-    // Verifique se o vídeo pertence ao usuário logado
     if videoUserID != userID {
         c.JSON(http.StatusForbidden, gin.H{"error": "Access denied: Video does not belong to this user"})
         return
     }
 
-    // Verifique se o caminho do arquivo processado existe
     if !processedFilePath.Valid || processedFilePath.String == "" {
         c.JSON(http.StatusNotFound, gin.H{"error": "Processed file path not found or invalid"})
         return
     }
 
-    // Servir o arquivo ZIP
-    // Use c.File() para servir o arquivo diretamente
-    // Note: O caminho é relativo ao WORKDIR do container (/app)
     filePathToServe := filepath.Join("/app", processedFilePath.String)
 
-    // Verifique se o arquivo existe no sistema de arquivos do contêiner
     if _, err := os.Stat(filePathToServe); os.IsNotExist(err) {
         c.JSON(http.StatusNotFound, gin.H{"error": "Processed file not found on server storage"})
         return
@@ -410,12 +403,19 @@ func startConsumer() {
 				sendNotification(msg.UserID, msg.OriginalFilename, "FAILED", fmt.Sprintf("Falha ao compactar frames: %s", errorMessage))
 				continue
 			}
-			defer newZipFile.Close()
+            // Removed defer newZipFile.Close() here
 
 			zipWriter := zip.NewWriter(newZipFile)
-			defer zipWriter.Close()
+            // Removed defer zipWriter.Close() here
 
-			frames, _ := filepath.Glob(filepath.Join(outputDir, fmt.Sprintf("%s_*.png", filepath.Base(msg.OriginalFilename))))
+			frames, err := filepath.Glob(filepath.Join(outputDir, fmt.Sprintf("%s_*.png", filepath.Base(msg.OriginalFilename))))
+            if err != nil {
+                errorMessage := fmt.Sprintf("Failed to list frames for zipping: %v", err)
+                log.Printf("ERROR: %s", errorMessage)
+                updateVideoStatus(msg.VideoStatusID, "FAILED", "", errorMessage)
+                sendNotification(msg.UserID, msg.OriginalFilename, "FAILED", "Falha ao listar frames para compactar.")
+                continue
+            }
 			if len(frames) == 0 {
 				errorMessage := "No frames extracted to zip."
 				log.Printf("WARNING: %s", errorMessage)
@@ -430,25 +430,52 @@ func startConsumer() {
 					log.Printf("WARNING: Could not open frame %s: %v", framePath, err)
 					continue
 				}
-				defer frameFile.Close()
+                // Removed defer frameFile.Close() here
 
-				writer, err := zipWriter.Create(filepath.Base(framePath))
+                header, err := zip.FileInfoHeader(frameFile.Stat())
+                if err != nil {
+                    log.Printf("WARNING: Could not get FileInfoHeader for %s: %v", framePath, err)
+                    frameFile.Close() // Close file on error
+                    continue
+                }
+                header.Name = filepath.Base(framePath)
+                header.Method = zip.Deflate
+
+				writer, err := zipWriter.CreateHeader(header)
 				if err != nil {
 					log.Printf("WARNING: Could not create entry for %s in zip: %v", framePath, err)
+                    frameFile.Close() // Close file on error
 					continue
 				}
 				_, err = io.Copy(writer, frameFile)
 				if err != nil {
 					log.Printf("WARNING: Could not copy %s to zip: %v", framePath, err)
+                    frameFile.Close() // Close file on error
 					continue
 				}
+                frameFile.Close() // Close file after successful copy
 			}
 
-			os.Remove(msg.VideoPath) // Remove o vídeo original após processamento
+            // Correct order to close zip writer and file
+            if err := zipWriter.Close(); err != nil {
+                errorMessage := fmt.Sprintf("Failed to close zip writer: %v", err)
+                log.Printf("ERROR: %s", errorMessage)
+                updateVideoStatus(msg.VideoStatusID, "FAILED", "", errorMessage)
+                sendNotification(msg.UserID, msg.OriginalFilename, "FAILED", "Falha ao finalizar compactação (zipWriter).")
+                continue
+            }
+            if err := newZipFile.Close(); err != nil {
+                errorMessage := fmt.Sprintf("Failed to close zip file: %v", err)
+                log.Printf("ERROR: %s", errorMessage)
+                updateVideoStatus(msg.VideoStatusID, "FAILED", "", errorMessage)
+                sendNotification(msg.UserID, msg.OriginalFilename, "FAILED", "Falha ao fechar arquivo compactado (newZipFile).")
+                continue
+            }
+
+			os.Remove(msg.VideoPath)
 			for _, framePath := range frames {
-				os.Remove(framePath) // Limpar frames temporários
+				os.Remove(framePath)
 			}
-
 
 			updateVideoStatus(msg.VideoStatusID, "COMPLETED", zipFilePath, "")
 			sendNotification(msg.UserID, msg.OriginalFilename, "COMPLETED", fmt.Sprintf("Seu vídeo '%s' foi processado com sucesso! Arquivo ZIP disponível em: %s", msg.OriginalFilename, zipFilePath))
@@ -512,7 +539,7 @@ func main() {
 	{
 		authRoutes.POST("/upload", uploadVideo)
         authRoutes.GET("/videos/status", listVideosStatus)
-        authRoutes.GET("/videos/:id/download", downloadProcessedVideo) // <--- ROTA: Download de vídeo
+        authRoutes.GET("/videos/:id/download", downloadProcessedVideo)
 	}
 
 	port := os.Getenv("PORT")
