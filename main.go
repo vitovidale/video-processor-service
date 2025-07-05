@@ -47,7 +47,7 @@ type VideoProcessingMessage struct {
 
 type VideoStatusResponse struct {
     ID               int       `json:"id"`
-    OriginalFilename string    `json:"original_filename"`
+    OriginalFilename string    `json:"json:original_filename"`
     Status           string    `json:"status"`
     ProcessedFilePath string   `json:"processed_file_path,omitempty"`
     ErrorMessage     string    `json:"error_message,omitempty"`
