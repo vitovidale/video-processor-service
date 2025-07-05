@@ -1,0 +1,14 @@
+# IDEs
+.vs/
+.vscode/
+.idea/
+
+# Go
+*.exe
+*.test
+*.out
+/tmp
+/vendor
+
+# Docker
+.dockerignore
