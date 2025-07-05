@@ -423,4 +423,24 @@ func main() {
 
 	go startConsumer() // Inicia o consumidor de mensagens em uma goroutine separada
 
-	router := gin
+	router := gin.Default()
+
+	router.GET("/health", healthCheck)
+	router.GET("/", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"message": "Video Processor Service is running!"})
+	})
+
+	authRoutes := router.Group("/")
+	authRoutes.Use(authMiddleware())
+	{
+		authRoutes.POST("/upload", uploadVideo)
+		// Rotas para listar status de vídeo e download virão aqui
+	}
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "5001"
+	}
+	log.Printf("Video Processor Service escutando na porta :%s...", port)
+	log.Fatal(router.Run(":" + port))
+}
