@@ -47,7 +47,7 @@ type VideoProcessingMessage struct {
 
 type VideoStatusResponse struct {
     ID               int       `json:"id"`
-    OriginalFilename string    `json:"json:original_filename"`
+    OriginalFilename string    `json:"original_filename"`
     Status           string    `json:"status"`
     ProcessedFilePath string   `json:"processed_file_path,omitempty"`
     ErrorMessage     string    `json:"error_message,omitempty"`
@@ -432,7 +432,13 @@ func startConsumer() {
 				}
                 // Removed defer frameFile.Close() here
 
-                header, err := zip.FileInfoHeader(frameFile.Stat())
+                fileInfo, err := frameFile.Stat() // Obtenha FileInfo e erro
+                if err != nil {
+                    log.Printf("WARNING: Could not get file info for %s: %v", framePath, err)
+                    frameFile.Close() // Close file on error
+                    continue
+                }
+                header, err := zip.FileInfoHeader(fileInfo) // Passe apenas fileInfo
                 if err != nil {
                     log.Printf("WARNING: Could not get FileInfoHeader for %s: %v", framePath, err)
                     frameFile.Close() // Close file on error
