@@ -1,19 +1,24 @@
-# Estágio de build
-FROM golang:1.24-alpine AS builder
-WORKDIR /app
-COPY go.mod .
-COPY go.sum .
-RUN go mod download 
-COPY . . 
-RUN CGO_ENABLED=0 GOOS=linux go build -o /video-processor-service .
+FROM golang:1.24-alpine AS builder 
 
-# Estágio final (imagem de produção menor)
+RUN apk update && apk add --no-cache ffmpeg
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN go build -o /app/video-processor-service ./cmd/main.go 
+
 FROM alpine:latest
+
+RUN apk update && apk add --no-cache ffmpeg
+
 WORKDIR /app
 
-# Instalar FFmpeg
-RUN apk add --no-cache ffmpeg
+COPY --from=builder /app/video-processor-service .
 
-COPY --from=builder /video-processor-service .
-EXPOSE 5001 
-CMD ["/app/video-processor-service"]
+EXPOSE 5001
+
+CMD ["./video-processor-service"]
