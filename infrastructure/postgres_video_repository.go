@@ -4,7 +4,7 @@ package infrastructure
 import (
     "database/sql"
     "fmt"
-    "your_project/domain" // Ajuste o caminho do import
+    "your_project/domain"
 )
 
 type PostgresVideoRepository struct {
