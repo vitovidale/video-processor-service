@@ -2,6 +2,9 @@
 
 Microsserviço Go responsável por gerenciar o upload e processamento de vídeos.
 
+<img width="885" height="914" alt="image" src="https://github.com/user-attachments/assets/09ff02d3-14ee-4a6c-bdf1-ccc218502aa3" />
+
+
 ## Funcionalidades
 
 * Upload de vídeos e enfileiramento para processamento.
