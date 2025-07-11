@@ -1,31 +1,31 @@
-name: CI - User Auth Service
+name: CI - Video Processor Service
 
 on:
   push:
     branches:
-      - main # Dispara o workflow em push para a branch main
+      - main
   pull_request:
     branches:
-      - main # Dispara o workflow em pull request para a branch main
+      - main
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest # O runner que executará o job
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4 # Clona o repositório
+        uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@v5 # Configura o ambiente Go
+        uses: actions/setup-go@v5
         with:
-          go-version: '1.22.x' # Use a mesma versão do Go que você está usando no Dockerfile (1.22 ou 1.24)
+          go-version: '1.22.x' # Use a mesma versão do Go que você está usando (ex: 1.22 ou 1.24)
 
       - name: Download Go modules
-        run: go mod download # Baixa as dependências do Go
+        run: go mod download
 
       - name: Build
-        run: go build -v ./... # Compila o projeto
+        run: go build -v ./...
 
       - name: Test
-        run: go test -v ./... # Roda os testes (se houver, senão passa sem erro)
+        run: go test -v ./...
