@@ -6,7 +6,7 @@ import (
     "io"
     "time"
     "log" // Temporário, para logs
-    "your_project/domain" // Ajuste o caminho do import
+    "your_project/domain"
 )
 
 type UploadVideoInput struct {
